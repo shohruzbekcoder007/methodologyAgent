@@ -218,6 +218,9 @@ class HermesHostService:
         self._sessions: dict[str, list[Any]] = {}
         # hermes_lite: langgraph graph; hermes: factory for AIAgent
         self._lite_graph: Any = None
+        # Whether that graph already carries the system prompt (prompt=) or
+        # expects it in the message list -- the two shapes below differ.
+        self._lite_has_prompt = False
         self._hermes_ok = False
 
     def initialize(self) -> dict[str, Any]:
@@ -372,6 +375,7 @@ class HermesHostService:
                 tools,
                 prompt=self.system_prompt,
             )
+            self._lite_has_prompt = True
             return True
         except TypeError:
             # older create_react_agent without prompt=
@@ -390,6 +394,7 @@ class HermesHostService:
                 self._lite_graph = create_react_agent(
                     llm, self._host_langchain_tools()
                 )
+                self._lite_has_prompt = False
                 return True
             except Exception as exc:  # noqa: BLE001
                 self._last_error = f"hermes_lite init failed: {exc}"
@@ -631,8 +636,15 @@ class HermesHostService:
         with _lock:
             prior = list(self._sessions.get(sid, []))
 
-        # Build message list: system + history + user
-        messages: list[Any] = [SystemMessage(content=self.system_prompt)]
+        # Build message list: system (only when the graph lacks it) +
+        # history + user. `create_react_agent(prompt=...)` prepends its own
+        # SystemMessage, so adding a second one leaves a system message at
+        # index 1 -- which vLLM rejects outright with "System message must
+        # be at the beginning." OpenAI tolerates the duplicate, which is why
+        # this stayed invisible until a local server was pointed at.
+        messages: list[Any] = []
+        if not self._lite_has_prompt:
+            messages.append(SystemMessage(content=self.system_prompt))
         messages.extend(prior)
         messages.append(HumanMessage(content=message))
 
@@ -643,12 +655,16 @@ class HermesHostService:
                 config={"recursion_limit": recursion},
             )
         except TypeError:
-            # graph without system in messages — prepend to user
+            # State schema refused the message list -- retry with the user
+            # turn alone, folding the prompt in only when the graph is not
+            # already carrying it.
+            content = (
+                message
+                if self._lite_has_prompt
+                else f"{self.system_prompt}\n\nUser: {message}"
+            )
             result = self._lite_graph.invoke(
-                {
-                    "messages": prior
-                    + [HumanMessage(content=f"{self.system_prompt}\n\nUser: {message}")]
-                },
+                {"messages": prior + [HumanMessage(content=content)]},
                 config={"recursion_limit": recursion},
             )
 
