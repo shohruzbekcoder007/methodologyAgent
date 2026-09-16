@@ -98,7 +98,7 @@ reaches outside the container:
 | `todo` | `todo` | plan multi-step work |
 
 Everything Hermes learns lives under `HERMES_HOME` — `memories/`, `skills/`,
-`sessions/`, `state.db`, `SOUL.md` — kept in the `ai-agents-hermes-home` named
+`sessions/`, `state.db`, `SOUL.md` — kept in the `methodologyagent-hermes-home` named
 volume so a redeploy does not wipe it. `config/hermes_config.yaml` is copied in
 only when the volume has no `config.yaml` yet; delete the volume to re-seed it.
 
@@ -143,7 +143,8 @@ Set `API_BEARER_TOKEN` to require `Authorization: Bearer …` on `/v1/chat`.
 Local: see [install_local.md](install_local.md) · Docker: see [install.md](install.md)
 
 ```bash
-curl -s localhost:8080/v1/chat -H 'content-type: application/json' \
+# Docker: host port is HOST_PORT (9095 by default). Running locally: 8080.
+curl -s localhost:9095/v1/chat -H 'content-type: application/json' \
   -d '{"message":"salom"}'
 ```
 

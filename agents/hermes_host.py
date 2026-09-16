@@ -12,12 +12,15 @@ If the Hermes package is unavailable, a Hermes-lite outer agent is used
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+
+from agents.user_profiles import UserProfile, resolve_profile
 
 logger = logging.getLogger("hermes_host")
 
@@ -47,6 +50,36 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+@contextlib.contextmanager
+def _hermes_home(path: Path) -> Iterator[None]:
+    """Point Hermes at `path` for the duration of the block.
+
+    Hermes resolves its home through `get_hermes_home()` on every call -- see
+    `tools/memory_tool.py::get_memory_dir` and `hermes_state.py` -- so this
+    redirects memory, session history and `session_search` for this request
+    alone. It is a ContextVar and deliberately not `os.environ`, which every
+    thread in the process shares.
+
+    A no-op when the Hermes package is absent (the hermes_lite path keeps no
+    on-disk per-profile state of its own).
+    """
+    try:
+        from hermes_constants import (  # type: ignore[import-not-found]
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Hermes home override unavailable: %s", exc)
+        yield
+        return
+
+    token = set_hermes_home_override(str(path))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _load_coordinator_prompt() -> str:
@@ -314,7 +347,9 @@ class HermesHostService:
             return {"enabled": True, "effort": effort}
         return {"enabled": False}
 
-    def _hermes_kwargs(self) -> dict[str, Any]:
+    def _hermes_kwargs(
+        self, profile: UserProfile | None = None
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model_name,
             "quiet_mode": _env_bool("HERMES_QUIET_MODE", True),
@@ -334,6 +369,12 @@ class HermesHostService:
         # what selects the right wire quirks.
         if self._hermes_provider:
             kwargs["provider"] = self._hermes_provider
+        # Hermes' own identity fields. The home override already separates the
+        # data; these make the agent aware of who it is talking to and keep the
+        # per-profile session files attributed correctly.
+        if profile is not None:
+            kwargs["user_id"] = profile.slug
+            kwargs["user_name"] = profile.raw_id or profile.slug
         return kwargs
 
     def _enabled_toolsets(self) -> list[str]:
@@ -426,9 +467,10 @@ class HermesHostService:
             "toolsets": self._enabled_toolsets(),
         }
 
-    def clear_session(self, session_id: str) -> None:
+    def clear_session(self, session_key: str) -> None:
+        """Drop one session. Takes the owner-prefixed key, not a raw client id."""
         with _lock:
-            self._sessions.pop(session_id, None)
+            self._sessions.pop(session_key, None)
 
     def chat(
         self,
@@ -436,12 +478,19 @@ class HermesHostService:
         *,
         session_id: str | None = None,
         reset_session: bool = False,
+        profile: UserProfile | None = None,
     ) -> dict[str, Any]:
         """
-        Host chat with optional multi-turn session.
+        Host chat with optional multi-turn session, scoped to `profile`.
+
         Never raises to callers.
         """
         try:
+            if profile is None:
+                # No caller identity. Whether that is even allowed is the API
+                # layer's decision (HERMES_REQUIRE_USER_ID); by the time it
+                # reaches here it gets the shared profile, not someone else's.
+                profile = resolve_profile(None)
             message = (message or "").strip()
             if not message:
                 return {
@@ -465,14 +514,21 @@ class HermesHostService:
 
             client_sid = (session_id or "").strip() or None
             sid = client_sid or str(uuid.uuid4())
+            # History is stored under an owner-prefixed key, while `sid` is what
+            # goes back to the client -- so a round-trip does not accumulate
+            # prefixes, and guessing another user's session_id lands on your own
+            # (empty) entry instead of their history.
+            key = profile.session_key(sid)
             if reset_session:
-                self.clear_session(sid)
+                self.clear_session(key)
 
             prior_len = 0
             with _lock:
-                prior_len = len(self._sessions.get(sid, []))
+                prior_len = len(self._sessions.get(key, []))
             logger.info(
-                "host.chat client_session_id=%r effective_sid=%s prior_history=%d backend=%s",
+                "host.chat user=%s client_session_id=%r effective_sid=%s "
+                "prior_history=%d backend=%s",
+                profile.slug,
                 client_sid,
                 sid,
                 prior_len,
@@ -487,8 +543,8 @@ class HermesHostService:
                     return task_result
 
             if self._backend == "hermes":
-                return self._chat_hermes(message, sid)
-            return self._chat_hermes_lite(message, sid)
+                return self._chat_hermes(message, sid, key, profile)
+            return self._chat_hermes_lite(message, sid, key)
         except Exception as exc:  # noqa: BLE001
             logger.error("hermes_host.chat failed: %s", exc, exc_info=True)
             return {
@@ -559,30 +615,40 @@ class HermesHostService:
             "mode": "task",
         }
 
-    def _chat_hermes(self, message: str, sid: str) -> dict[str, Any]:
+    def _chat_hermes(
+        self, message: str, sid: str, key: str, profile: UserProfile
+    ) -> dict[str, Any]:
         from run_agent import AIAgent  # type: ignore[import-not-found]
 
         history: list[Any] | None = None
         with _lock:
-            if sid in self._sessions:
-                history = list(self._sessions[sid])
+            if key in self._sessions:
+                history = list(self._sessions[key])
 
-        agent = AIAgent(**self._hermes_kwargs())
-        try:
-            if history:
-                result = agent.run_conversation(
-                    user_message=message,
-                    conversation_history=history,
-                    system_message=self.system_prompt,
-                )
-            else:
-                result = agent.run_conversation(
-                    user_message=message,
-                    system_message=self.system_prompt,
-                )
-        except TypeError:
-            # older signature
-            result = agent.run_conversation(user_message=message)
+        kwargs = self._hermes_kwargs(profile)
+        kwargs["session_id"] = sid
+        kwargs["chat_id"] = sid
+
+        # The override must cover construction *and* the conversation: Hermes
+        # loads memory while the agent is being built, and its tools resolve
+        # the home again while the loop runs.
+        with _hermes_home(profile.home):
+            agent = AIAgent(**kwargs)
+            try:
+                if history:
+                    result = agent.run_conversation(
+                        user_message=message,
+                        conversation_history=history,
+                        system_message=self.system_prompt,
+                    )
+                else:
+                    result = agent.run_conversation(
+                        user_message=message,
+                        system_message=self.system_prompt,
+                    )
+            except TypeError:
+                # older signature
+                result = agent.run_conversation(user_message=message)
 
         failed = False
         err: str | None = None
@@ -604,7 +670,7 @@ class HermesHostService:
             if len(trimmed) > limit:
                 trimmed = trimmed[-limit:]
             with _lock:
-                self._sessions[sid] = trimmed
+                self._sessions[key] = trimmed
 
         if failed:
             return {
@@ -630,11 +696,13 @@ class HermesHostService:
             "mode": "hermes_tool_host",
         }
 
-    def _chat_hermes_lite(self, message: str, sid: str) -> dict[str, Any]:
+    def _chat_hermes_lite(
+        self, message: str, sid: str, key: str
+    ) -> dict[str, Any]:
         from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
         with _lock:
-            prior = list(self._sessions.get(sid, []))
+            prior = list(self._sessions.get(key, []))
 
         # Build message list: system (only when the graph lacks it) +
         # history + user. `create_react_agent(prompt=...)` prepends its own
@@ -690,7 +758,7 @@ class HermesHostService:
             if len(new_hist) > limit:
                 new_hist = new_hist[-limit:]
             with _lock:
-                self._sessions[sid] = new_hist
+                self._sessions[key] = new_hist
 
         # Count tool calls made during this turn
         tool_hits = 0
