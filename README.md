@@ -165,6 +165,66 @@ Data survives `docker compose down`; only `down -v` clears the volumes
 `methodologyagent-neo4j-data`, `methodologyagent-neo4j-logs`) — and that is one
 re-run away from being back.
 
+### Semantic search
+
+Retrieval is hybrid: BM25 over Neo4j's `search_text` finds an exact wording,
+vector search over `embedding` finds a passage that answers the question
+without repeating its words, and the two rankings are fused with RRF. On a
+worded-around question the vector half contributes almost all the recall — in
+a check on the restored corpus, 17 of its top 20 passages were ones BM25 never
+returned.
+
+`scripts/embed_chunks.sh` builds the vector side:
+
+```bash
+./scripts/embed_chunks.sh                    # everything still pending
+./scripts/embed_chunks.sh --status           # what is embedded, index state
+./scripts/embed_chunks.sh --only terms
+./scripts/embed_chunks.sh --limit 200        # a slice, to try it
+./scripts/embed_chunks.sh --force            # rebuild every vector
+./scripts/embed_chunks.sh --check "narx o'zgarishi qanday o'lchanadi"
+```
+
+| What | Count | Embedded from |
+|---|---|---|
+| `Chunk` | 26 342 | `chunks.text` in MongoDB, section heading prepended |
+| `Term` | 1 308 | name + definition |
+
+The text comes from MongoDB, not from Neo4j, and that is deliberate. Neo4j's
+`search_text` is a complete copy of the corpus (29.3M characters against 28.8M
+of original) but it is transliterated to Latin, and transliteration flattens
+what a multilingual model reads best — abbreviations and proper names above
+all. The vectors are written back onto the Neo4j nodes, so one Cypher query
+can search and walk the graph together.
+
+The embedding service is external: this stack does not run it, it points at
+one. `EMBEDDING_BASE_URL` defaults to `host.docker.internal:8090`, and the
+script refuses to start if nothing answers there. Whatever the service reports
+as its `index_key` (provider, model and dimensions) is stored beside every
+vector, which is what makes the run resumable and a model change safe:
+
+* no vector, or one from another model → pending;
+* interrupted run → the next one continues where it stopped;
+* different model → everything is rebuilt, because vectors from two models are
+  not comparable and mixing them would spoil every later search with no error
+  anywhere to explain it.
+
+With BAAI/bge-m3 on a GPU the full corpus takes about 7 minutes end to end
+(~60 chunks/s including the MongoDB reads and Neo4j writes).
+
+### Documents with no text
+
+361 of the 1 185 documents converted to nothing, so they carry no chunk and no
+search can reach their contents. Every one of them has a `READABLE_SIBLING`
+edge to a copy that did convert, and `agents/knowledge/retrieval.py` follows
+it: the document card comes back with `has_text: false`, the sibling under
+`read_instead`, and a note saying the text is missing and a readable copy is
+being shown instead. The sibling's text is never passed off as the original's.
+
+Their real content is not in the databases at all — `l1_uri` names the source
+PDF/DOCX, but that drive was not mounted during the ingest and the GridFS `l1`
+bucket was never created.
+
 ### Taking a backup
 
 The dump side is not scripted, because it belongs to whichever stack owns the
@@ -186,7 +246,12 @@ docker compose start neo4j
 ```
 agents/
   hermes_host.py    host agent: sessions, backends, tool loop
+  user_profiles.py  one Hermes home per user; the slug is the boundary
   example_tool.py   template tool (`echo`) — copy this for your own
+  knowledge/
+    store.py        Neo4j, MongoDB and embedding connections (singletons)
+    retrieval.py    hybrid search, graph expansion, readable-sibling redirect
+    text.py         Cyrillic → Latin, matching what the ingest indexed
 app/
   api.py            FastAPI routes
   main.py           process entrypoint (uvicorn)
@@ -200,10 +265,33 @@ scripts/
   start.sh             container entrypoint
   healthcheck.sh
   restore_backups.sh   restore Mongo + Neo4j from data/backups/
+  embed_chunks.sh      build the vector side of search (driver)
+  embed_chunks.py      …its worker, run inside the app container
 data/
   backups/             *.archive.gz, *.dump — git-ignored
   MONGODB_SCHEMA.md    every collection, field and index
   NEO4J_SCHEMA.md      every label, property, relationship and index
+```
+
+## Scripts
+
+Both are re-runnable and both refuse to guess: they check what they are about
+to touch, say so, and stop rather than half-finish.
+
+| Script | What it is for |
+|---|---|
+| [`scripts/restore_backups.sh`](scripts/restore_backups.sh) | Loads MongoDB and Neo4j from `data/backups/`. Picks the newest archive and dump, or takes named ones. Mongo restores while it serves; Neo4j Community loads a dump only into a stopped store, so the script stops the service, loads in a throwaway container against the data volume, and starts it again. Prints what landed. |
+| [`scripts/embed_chunks.sh`](scripts/embed_chunks.sh) | Embeds the corpus and writes the vectors onto the Neo4j nodes, then creates the vector indexes. Resumable: only nodes without a current vector are touched. `--status` shows what is embedded, `--check` runs a real search through the retrieval layer. |
+| [`scripts/start.sh`](scripts/start.sh) | Container entrypoint. Fixes volume ownership, seeds `config.yaml` and `SOUL.md` into the shared home, drops from root to `appuser`, starts the server. Not run by hand. |
+| [`scripts/healthcheck.sh`](scripts/healthcheck.sh) | What Docker's `HEALTHCHECK` calls. Not run by hand. |
+
+Order matters once, on a fresh machine: restore first, embed second. Embedding
+an empty database succeeds and does nothing.
+
+```bash
+./scripts/restore_backups.sh --yes
+./scripts/embed_chunks.sh
+./scripts/embed_chunks.sh --status
 ```
 
 ## Endpoints
@@ -271,5 +359,8 @@ All via environment (`.env`, see `.env.example`).
 | `NEO4J_BOLT_PORT` | `9097` | driver connections from the host |
 | `NEO4J_HEAP` / `NEO4J_PAGECACHE` | `1G` | raise both for an ingest run |
 | `BIND_ADDRESS` | `127.0.0.1` | interface every published port binds to |
+| `EMBEDDING_BASE_URL` | `host.docker.internal:8090` | external embedding service |
+| `EMBEDDING_BATCH` | `64` | must not exceed the service's `batch_max` |
+| `EMBEDDING_TIMEOUT` | `120` | seconds per request |
 
 Sessions are in-process and per-worker: `API_WORKERS>1` will split them.

@@ -22,6 +22,8 @@ dependencies = [
   "langchain-openai>=0.2.0",
   "langchain-core>=0.3.0",
   "langgraph>=0.2.0",
+  "neo4j>=5.26,<6.0",
+  "pymongo>=4.9,<5.0",
 ]
 
 [project.scripts]
@@ -29,7 +31,7 @@ methodologyagent = "app.main:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["agents", "app"]
+packages = ["agents", "agents.knowledge", "app"]
 
 [tool.setuptools.package-dir]
 agents = "agents"

@@ -78,6 +78,12 @@ services:
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      # Embedding service for semantic search. External and not managed by
+      # this compose file -- host.docker.internal is what makes a service on
+      # the host reachable from in here (see extra_hosts below).
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://host.docker.internal:8090}
+      EMBEDDING_BATCH: ${EMBEDDING_BATCH:-64}
+      EMBEDDING_TIMEOUT: ${EMBEDDING_TIMEOUT:-120}
 
     # The host agent's tools query both stores, so it waits for them rather
     # than starting into connection errors. `service_healthy`, not
