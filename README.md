@@ -251,6 +251,9 @@ agents/
   knowledge/
     store.py        Neo4j, MongoDB and embedding connections (singletons)
     retrieval.py    hybrid search, graph expansion, readable-sibling redirect
+    graph.py        traversal, document text, counting
+    hermes_tools.py the five tools, for the hermes backend's registry
+    tools.py        the same five as langchain tools, for hermes_lite
     text.py         Cyrillic → Latin, matching what the ingest indexed
 app/
   api.py            FastAPI routes
@@ -316,6 +319,71 @@ curl -s localhost:9095/v1/chat -H 'content-type: application/json' \
   -d '{"message":"salom"}'
 ```
 
+## Tools
+
+Four, registered under one toolset named `knowledge`. Each description says
+when to use the tool *and when not to* — the negative half is what stops a
+27B model reaching for search when the answer is already in front of it.
+
+| Tool | For | Reads |
+|---|---|---|
+| `search_knowledge` | Content: how an indicator is computed, a procedure, a definition | Neo4j (BM25 + vector) → MongoDB `chunks.text` |
+| `get_document` | A document's card, and its text when `include_text` asks for it | Neo4j, plus MongoDB `chunks.text` with text |
+| `find_related` | What it cites, who cites it, other copies, source files | Neo4j only |
+| `count_documents` | "how many", by folder / year / kind / collection | Neo4j only |
+
+`find_related` is why four is enough. Rather than one tool per relation, it
+takes any of the catalogue's 77 relation types as an argument, and called
+without one it returns the relations *this* node actually has, with counts. So
+the model looks first and drills second instead of guessing from a list of 77.
+The type is validated against `db.relationshipTypes()` before it reaches the
+query, because Cypher cannot parameterise a relationship type and it has to be
+interpolated.
+
+`get_document` covers both the card and the text. They were two tools until
+the split turned out to be one the caller never has to make: same input, same
+document, and a model choosing between "tell me about this" and "show me
+this" is spending a decision on nothing. `include_text` says it in one
+argument.
+
+Between them the four reach about 99% of the 53 133 nodes and 95% of the
+195 029 relationships. What they do not reach: GridFS file bytes, the
+`source_records` conversion log, and the reviewed layer (`ActVersion`,
+`Citation`, `Evidence`) beyond what `find_related` surfaces as neighbours.
+
+### Two adapters, one implementation
+
+`AIAgent` has no parameter for LangChain tools — it builds its tool list from
+its own registry, filtered by `enabled_toolsets`. So there are two adapters
+over the same functions:
+
+```
+agents/knowledge/retrieval.py   search, documents, the readable-sibling redirect
+agents/knowledge/graph.py       traversal, document text, counting
+        ├─ hermes_tools.py      tools.registry.register(...)   → the hermes backend
+        └─ tools.py             langchain @tool                → the hermes_lite backend
+```
+
+The `knowledge` toolset is added to `HERMES_ENABLED_TOOLSETS` whether or not
+it is listed there — leaving the corpus tools out of this service is a
+misconfiguration, not a choice. `HERMES_DISABLE_KNOWLEDGE_TOOLSET=true` turns
+them off for real.
+
+### Cost of one call
+
+Measured on the restored corpus, `search_knowledge` with `limit=5`:
+
+```
+249 ms    1 embedding call     3 Neo4j queries     15 MongoDB documents, 18.8 KB
+```
+
+Passages are chosen before their text is read, which is what keeps the
+MongoDB side at 18.8 KB: reading first pulled 94.4 KB, most of it for
+candidates that lost to a duplicate before anyone looked at them. Results are
+capped at 1 500 characters of passage, 300 of context either side and 14 000
+per call, and the call stops adding results rather than truncating one —
+a passage cut in half reads as if the document says less than it does.
+
 ## Adding a tool
 
 1. Copy `agents/example_tool.py`, rename the function, write a real docstring —
@@ -341,7 +409,8 @@ All via environment (`.env`, see `.env.example`).
 | `HERMES_TASK_ROUTING` | `true` | `false` = never route to the task model |
 | `HERMES_INFERENCE_PROVIDER` | from `LLM_PROVIDER` | override only |
 | `HERMES_SYSTEM_PROMPT_PATH` | `prompts/hermes_coordinator.md` | host prompt |
-| `HERMES_ENABLED_TOOLSETS` | `memory,session_search,skills,todo` | comma-separated Hermes toolsets |
+| `HERMES_ENABLED_TOOLSETS` | `memory,session_search,skills,todo` | comma-separated Hermes toolsets; `knowledge` is always added |
+| `HERMES_DISABLE_KNOWLEDGE_TOOLSET` | `false` | `true` = no corpus tools at all |
 | `HERMES_MAX_ITERATIONS` | `12` | tool-loop cap |
 | `HERMES_SESSION_HISTORY_LIMIT` | `6` | turns kept per session |
 | `HERMES_SKIP_MEMORY` | `false` | `true` = stateless |

@@ -255,6 +255,7 @@ class HermesHostService:
         # expects it in the message list -- the two shapes below differ.
         self._lite_has_prompt = False
         self._hermes_ok = False
+        self._knowledge_tools: list[str] = []
 
     def initialize(self) -> dict[str, Any]:
         with _lock:
@@ -286,6 +287,11 @@ class HermesHostService:
                 discover_plugins()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("discover_plugins: %s", exc)
+
+            # Before the first AIAgent is built, never after: the agent reads
+            # the tool registry once while assembling its tool list, so a tool
+            # registered later is invisible for that agent's whole life.
+            self._knowledge_tools = self._register_knowledge_tools()
 
             # Prefer real Hermes AIAgent
             if self._try_init_hermes():
@@ -385,24 +391,66 @@ class HermesHostService:
             kwargs["user_name"] = profile.raw_id or profile.slug
         return kwargs
 
+    def _register_knowledge_tools(self) -> list[str]:
+        """Register the corpus tools into Hermes' own registry.
+
+        The LangChain wrappers only reach the `hermes_lite` backend; `AIAgent`
+        takes no tools argument and builds its list from the registry instead.
+        """
+        try:
+            from agents.knowledge.hermes_tools import register_hermes_tools
+
+            names = register_hermes_tools()
+            if names:
+                logger.info("knowledge tools registered: %s", ", ".join(names))
+            return names
+        except Exception as exc:  # noqa: BLE001
+            logger.error("knowledge tools not registered: %s", exc, exc_info=True)
+            return []
+
     def _enabled_toolsets(self) -> list[str]:
-        """Parse HERMES_ENABLED_TOOLSETS (empty by default in the starter)."""
+        """Parse HERMES_ENABLED_TOOLSETS.
+
+        `knowledge` is added whether or not it is listed: the corpus tools are
+        the point of this service, and leaving them out of the variable is a
+        misconfiguration rather than a choice. Set
+        HERMES_DISABLE_KNOWLEDGE_TOOLSET=true to actually turn them off.
+        """
         raw = _env("HERMES_ENABLED_TOOLSETS")
-        return [t.strip() for t in raw.split(",") if t.strip()]
+        toolsets = [t.strip() for t in raw.split(",") if t.strip()]
+        if not _env_bool("HERMES_DISABLE_KNOWLEDGE_TOOLSET", False):
+            from agents.knowledge.hermes_tools import TOOLSET as KNOWLEDGE_TOOLSET
+
+            if KNOWLEDGE_TOOLSET not in toolsets:
+                toolsets.insert(0, KNOWLEDGE_TOOLSET)
+        return toolsets
 
     def _host_langchain_tools(self) -> list[Any]:
         """
         Tools exposed to the host agent.
 
         Add your own here — see `agents/example_tool.py` for the shape.
+
+        The knowledge tools load first and are not optional in the way the
+        example is: if they fail to import the agent can still hold a
+        conversation, but it has nothing to answer from, so the failure is
+        logged loudly rather than at debug.
         """
         tools: list[Any] = []
         try:
-            from agents.example_tool import as_langchain_tools
+            from agents.knowledge.tools import as_langchain_tools as knowledge_tools
 
-            tools.extend(as_langchain_tools())
+            tools.extend(knowledge_tools())
         except Exception as exc:  # noqa: BLE001
-            logger.debug("example tools not loaded: %s", exc)
+            logger.error("knowledge tools not loaded: %s", exc, exc_info=True)
+
+        if _env_bool("HERMES_ENABLE_EXAMPLE_TOOL", False):
+            try:
+                from agents.example_tool import as_langchain_tools
+
+                tools.extend(as_langchain_tools())
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("example tools not loaded: %s", exc)
         return tools
 
     def _try_init_hermes_lite(self) -> bool:
@@ -471,7 +519,15 @@ class HermesHostService:
             "skip_memory": self.skip_memory,
             "session_count": len(self._sessions),
             "error": self._last_error,
-            "tools": [getattr(t, "name", str(t)) for t in self._host_langchain_tools()],
+            # What the model can actually call. The two backends take tools by
+            # different routes -- Hermes from its registry, hermes_lite from
+            # the LangChain list -- so reporting one list for both would name
+            # tools that are not there.
+            "tools": (
+                self._knowledge_tools
+                if self._backend == "hermes"
+                else [getattr(t, "name", str(t)) for t in self._host_langchain_tools()]
+            ),
             "toolsets": self._enabled_toolsets(),
         }
 

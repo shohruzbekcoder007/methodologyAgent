@@ -120,12 +120,22 @@ def _chunk_texts(ids: list[str]) -> dict[str, dict[str, Any]]:
     return {doc["_id"]: doc for doc in cursor}
 
 
+# A tool result is spent context: everything it returns crowds out the
+# conversation and every later turn carries it. These caps are per call, and
+# they are characters because that is what we can measure without a tokenizer
+# -- roughly four per token for this corpus.
+TEXT_CHARS = 1500
+CONTEXT_CHARS = 300
+BUDGET_CHARS = 14_000
+
+
 def search_chunks(
     query: str,
     *,
     limit: int = 8,
     candidates: int = 50,
     neighbours: bool = True,
+    budget_chars: int = BUDGET_CHARS,
 ) -> list[dict[str, Any]]:
     """Hybrid search returning passages with their place in the corpus."""
     query = (query or "").strip()
@@ -146,17 +156,10 @@ def search_chunks(
     rows = read_query(_EXPAND_CYPHER, keys=ordered[: limit * 3])
     by_key = {r["key"]: r for r in rows}
 
-    wanted: list[str] = []
-    for key in ordered[: limit * 3]:
-        row = by_key.get(key)
-        if row is None:
-            continue
-        wanted.append(row["chunk_id"])
-        if neighbours:
-            wanted.extend(i for i in (row.get("prev_id"), row.get("next_id")) if i)
-    texts = _chunk_texts(wanted)
-
-    results: list[dict[str, Any]] = []
+    # Pick the final passages first, read their text second. The other order
+    # pulled three times as much out of MongoDB as it returned, because most
+    # candidates lose to a duplicate before anyone reads them.
+    chosen: list[tuple[str, dict[str, Any]]] = []
     seen_sha: set[str] = set()
     for key in ordered[: limit * 3]:
         row = by_key.get(key)
@@ -169,22 +172,43 @@ def search_chunks(
         if sha in seen_sha:
             continue
         seen_sha.add(sha)
+        chosen.append((key, row))
+        if len(chosen) >= limit:
+            break
 
+    wanted: list[str] = []
+    for _, row in chosen:
+        wanted.append(row["chunk_id"])
+        if neighbours:
+            wanted.extend(i for i in (row.get("prev_id"), row.get("next_id")) if i)
+    texts = _chunk_texts(wanted)
+
+    results: list[dict[str, Any]] = []
+    spent = 0
+    for key, row in chosen:
         body = texts.get(row["chunk_id"], {})
+        text = (body.get("text") or "")[:TEXT_CHARS]
         context = {}
         if neighbours:
             for side in ("prev", "next"):
                 cid = row.get(f"{side}_id")
                 if cid and cid in texts:
-                    context[side] = texts[cid].get("text", "")
+                    context[side] = (texts[cid].get("text") or "")[:CONTEXT_CHARS]
+
+        cost = len(text) + sum(len(v) for v in context.values())
+        if results and spent + cost > budget_chars:
+            # Stop rather than truncate: a passage cut in half reads as if the
+            # document says less than it does.
+            break
+        spent += cost
 
         results.append(
             {
                 "score": round(fused[key], 5),
-                "text": body.get("text", ""),
+                "text": text,
                 "context": context,
                 "citation": {
-                    "sha256": sha,
+                    "sha256": row.get("sha256"),
                     "title": row.get("title"),
                     "section": row.get("section_path") or row.get("section_title"),
                     "paragraphs": row.get("paragraphs"),
@@ -198,8 +222,6 @@ def search_chunks(
                 },
             }
         )
-        if len(results) >= limit:
-            break
     return results
 
 
