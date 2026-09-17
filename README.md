@@ -106,6 +106,81 @@ Toolsets such as `terminal`, `code_execution`, `file` and `browser` let the
 agent act inside the container. Set `API_BEARER_TOKEN` before enabling any of
 them — `/v1/chat` is unauthenticated while it is unset.
 
+## Knowledge stores
+
+Two databases ship with the stack, restored from a backup rather than built by
+an ingest run:
+
+| Service | Image | Holds | Host port (loopback) |
+|---|---|---|---|
+| `mongo` | `mongo:7.0` | 45 collections, 251 728 documents, GridFS files | `27118` |
+| `neo4j` | `neo4j:5.26-community` | 53 133 nodes, 195 029 relationships | `9096` (browser), `9097` (bolt) |
+
+The versions are pinned to the backups: a Neo4j dump never loads into an older
+store, and a Mongo archive tracks the server that wrote it. Neo4j is published
+in this stack's own block beside the app's 9095 rather than on the 7474/7687
+ladder every other Neo4j container competes for, so a graph container started
+later will not collide with it. The app reaches both by service name on the compose network, so
+nothing here depends on the published ports — they are for `mongosh`, Neo4j
+Browser and other tools you run by hand.
+
+The two stores reference each other: every Neo4j node carries `mongo_id`,
+`mongo_db` and `mongo_collection`, and `edges` in Mongo mirrors the graph. They
+are backed up as a pair and should be restored as a pair. Field-by-field
+reference: [data/MONGODB_SCHEMA.md](data/MONGODB_SCHEMA.md),
+[data/NEO4J_SCHEMA.md](data/NEO4J_SCHEMA.md).
+
+### Restore
+
+Backups live in `data/backups/` (git-ignored). The script picks the newest of
+each kind, or takes an explicit file:
+
+```bash
+./scripts/restore_backups.sh              # newest of each, asks first
+./scripts/restore_backups.sh --yes        # no prompt
+./scripts/restore_backups.sh --list       # what is available
+./scripts/restore_backups.sh --only mongo
+./scripts/restore_backups.sh --neo4j-file nmc-neo4j-5.26-20260915-2111.dump
+```
+
+Run it as often as you like: Mongo restores with `--drop` and Neo4j with
+`--overwrite-destination`, so the second run ends where the first did. Both
+stores lose whatever they held, which is why it asks before starting and
+refuses outright when it is not attached to a terminal and `--yes` is absent.
+
+Mongo restores while it serves. Neo4j Community loads a dump only into a
+stopped store, so the script stops the service, runs `neo4j-admin database
+load` in a throwaway container attached to the `methodologyagent-neo4j-data`
+volume, and starts it again — a few minutes of downtime for the graph.
+
+Afterwards it prints what landed, which is the check worth reading:
+
+```
+[restore] mongo: 45 collections, 251728 documents
+[restore] neo4j: 53133 nodes
+```
+
+Data survives `docker compose down`; only `down -v` clears the volumes
+(`methodologyagent-mongo-data`, `methodologyagent-mongo-config`,
+`methodologyagent-neo4j-data`, `methodologyagent-neo4j-logs`) — and that is one
+re-run away from being back.
+
+### Taking a backup
+
+The dump side is not scripted, because it belongs to whichever stack owns the
+data. Against this one:
+
+```bash
+# Mongo — online
+MSYS_NO_PATHCONV=1 docker exec methodologyagent-mongo mongodump   --username nmc --password '<MONGO_ROOT_PASSWORD>' --authenticationDatabase admin   --db nmc --gzip --archive=/tmp/nmc.archive.gz
+docker cp methodologyagent-mongo:/tmp/nmc.archive.gz   "data/backups/nmc-mongo-7.0-$(date +%Y%m%d-%H%M).archive.gz"
+
+# Neo4j — offline
+docker compose stop neo4j
+MSYS_NO_PATHCONV=1 docker run --rm   -v methodologyagent-neo4j-data:/data -v "$(pwd)/data/backups:/backups"   neo4j:5.26-community neo4j-admin database dump neo4j --to-path=/backups
+docker compose start neo4j
+```
+
 ## Layout
 
 ```
@@ -122,8 +197,13 @@ config/
 prompts/
   hermes_coordinator.md  host system prompt
 scripts/
-  start.sh          container entrypoint
+  start.sh             container entrypoint
   healthcheck.sh
+  restore_backups.sh   restore Mongo + Neo4j from data/backups/
+data/
+  backups/             *.archive.gz, *.dump — git-ignored
+  MONGODB_SCHEMA.md    every collection, field and index
+  NEO4J_SCHEMA.md      every label, property, relationship and index
 ```
 
 ## Endpoints
@@ -180,5 +260,16 @@ All via environment (`.env`, see `.env.example`).
 | `HERMES_REASONING_ENABLED` | `false` | keep `false` on gpt-4* |
 | `API_BEARER_TOKEN` | — | unset = no auth |
 | `CORS_ORIGINS` | `*` | comma-separated |
+| `MONGO_ROOT_USER` | `nmc` | Mongo root user |
+| `MONGO_ROOT_PASSWORD` | — | required; compose refuses to start without it |
+| `MONGO_DB` | `nmc` | database the backup restores into |
+| `MONGO_PORT` | `27118` | loopback host port |
+| `NEO4J_USER` | `neo4j` | Community Edition has no other |
+| `NEO4J_PASSWORD` | — | required; compose refuses to start without it |
+| `NEO4J_DATABASE` | `neo4j` | Community serves one user database |
+| `NEO4J_HTTP_PORT` | `9096` | Neo4j Browser |
+| `NEO4J_BOLT_PORT` | `9097` | driver connections from the host |
+| `NEO4J_HEAP` / `NEO4J_PAGECACHE` | `1G` | raise both for an ingest run |
+| `BIND_ADDRESS` | `127.0.0.1` | interface every published port binds to |
 
 Sessions are in-process and per-worker: `API_WORKERS>1` will split them.

@@ -68,6 +68,25 @@ services:
       # calls server-side and needs none.
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       HEALTHCHECK_URL: http://127.0.0.1:8080/health
+      # Knowledge stores. Restored from data/backups by
+      # scripts/restore_backups.sh -- see README "Bilimlar bazasi".
+      # Service names, not published ports: these resolve on the compose
+      # network, so the loopback bindings below stay for human tools only.
+      MONGO_URI: mongodb://${MONGO_ROOT_USER:-nmc}:${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}@mongo:27017/?authSource=admin
+      MONGO_DB: ${MONGO_DB:-nmc}
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+
+    # The host agent's tools query both stores, so it waits for them rather
+    # than starting into connection errors. `service_healthy`, not
+    # `service_started`: Neo4j accepts TCP long before it answers Bolt.
+    depends_on:
+      mongo:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
 
     ports:
       # host:container — APP_PORT is the in-container bind port (always 8080);
@@ -113,11 +132,123 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # ---------------------------------------------------------------------------
+  # Knowledge stores
+  #
+  # Both are restored from `data/backups/` by `scripts/restore_backups.sh`;
+  # they start empty otherwise. Image versions match the backups exactly --
+  # mongo:7.0 for a 7.0 archive, neo4j:5.26 for a 5.26 dump -- because a dump
+  # never loads into an older store and the archive format tracks the server.
+  #
+  # Published ports are loopback-only and sit in this stack's own block next
+  # to the app's 9095 -- 9096 and 9097, nowhere near the ports a Neo4j or
+  # Mongo container conventionally takes (7474/7687, 27017 and the 17474 /
+  # 27117 offsets the nmc-knowledge stack uses). Another graph container
+  # started later will not land on them by accident.
+  #
+  # Nothing in this project connects through them: the app reaches the two
+  # services by name on the compose network.
+  # ---------------------------------------------------------------------------
+  mongo:
+    image: mongo:7.0
+    container_name: methodologyagent-mongo
+    restart: unless-stopped
+
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-nmc}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
+
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${MONGO_PORT:-27118}:27017"
+
+    volumes:
+      - mongo_data:/data/db
+      - mongo_config:/data/configdb
+      # mongorestore reads the archive straight off this mount -- faster than
+      # piping ~90 MB through docker's stdin, and read-only because nothing
+      # here should ever write back into the backup folder.
+      - ./data/backups:/backups:ro
+
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: methodologyagent-neo4j
+    restart: unless-stopped
+
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-1G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
+      # Browser at http://127.0.0.1:9096 connects over Bolt from the host, so
+      # it must be told the published address rather than the container's.
+      NEO4J_server_bolt_advertised__address: 127.0.0.1:${NEO4J_BOLT_PORT:-9097}
+      NEO4J_server_http_advertised__address: 127.0.0.1:${NEO4J_HTTP_PORT:-9096}
+
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${NEO4J_HTTP_PORT:-9096}:7474"
+      - "${BIND_ADDRESS:-127.0.0.1}:${NEO4J_BOLT_PORT:-9097}:7687"
+
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      # Community Edition loads a dump only while the store is stopped, so the
+      # restore script does it from a throwaway container against `neo4j_data`
+      # rather than through this one. The mount is here for `neo4j-admin
+      # database dump` and for inspecting what is in the folder.
+      - ./data/backups:/backups:ro
+
+    healthcheck:
+      # Bolt, not HTTP: the app talks Bolt, and HTTP answers a few seconds
+      # earlier -- long enough for a dependent service to start too soon.
+      # The credentials are interpolated by compose, not read inside the
+      # container: the neo4j image turns any other NEO4J_* variable into a
+      # config setting and refuses to start on an unknown one.
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER:-neo4j} -p '${NEO4J_PASSWORD}' 'RETURN 1' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   hermes_home:
     name: methodologyagent-hermes-home
   hermes_users:
     name: methodologyagent-hermes-users
+  # Survive `down`; only `down -v` clears them, and a cleared store is a
+  # re-run of scripts/restore_backups.sh away.
+  mongo_data:
+    name: methodologyagent-mongo-data
+  mongo_config:
+    name: methodologyagent-mongo-config
+  neo4j_data:
+    name: methodologyagent-neo4j-data
+  neo4j_logs:
+    name: methodologyagent-neo4j-logs
 
 networks:
   default:
