@@ -142,6 +142,90 @@ def _seed_template() -> Optional[Path]:
     return None
 
 
+def _soul_template() -> Optional[Path]:
+    """The agent's own `SOUL.md`, seeded into every profile.
+
+    The framework writes a stock SOUL.md on first run, and its opening sentence
+    names the framework and its vendor. That text is injected into the model's
+    context on every turn, so leaving it in place means the agent is being told
+    one identity while the system prompt gives it another. Ours replaces it.
+    """
+    raw = os.getenv("AGENT_SOUL_TEMPLATE", "").strip()
+    candidates = [Path(raw)] if raw else []
+    candidates.append(Path(__file__).resolve().parent.parent / "prompts" / "agent_soul.md")
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+# Markers of the framework's stock SOUL.md. A file carrying one of these is a
+# default we may overwrite; anything else is either ours already or something
+# the agent wrote about itself, and is left alone.
+_STOCK_SOUL_MARKERS = ("Hermes Agent", "Nous Research")
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _install_soul(home: Path) -> None:
+    """Put our SOUL.md in `home`, keeping it in step with the template.
+
+    Three cases, and the third is the reason this is not a one-line copy:
+
+    * no file, or the framework's stock one -> write ours;
+    * ours, unchanged since we wrote it, but the template has moved on ->
+      write the new one, so editing `prompts/agent_soul.md` reaches profiles
+      that already exist rather than only new ones;
+    * edited since we wrote it -> leave it. That is either an operator's
+      change or the agent writing about itself, and neither should be lost.
+
+    The sidecar records what we last wrote, which is what makes "unchanged
+    since we wrote it" answerable. It is a hash, not a copy, and it stays out
+    of SOUL.md so nothing extra reaches the model's context.
+    """
+    template = _soul_template()
+    if template is None:
+        return
+    soul = home / "SOUL.md"
+    sidecar = home / ".soul_installed_sha256"
+
+    try:
+        wanted = template.read_bytes()
+    except OSError as exc:  # noqa: BLE001
+        logger.warning("could not read SOUL template %s: %s", template, exc)
+        return
+
+    reason = "seeding"
+    if soul.exists():
+        try:
+            current = soul.read_bytes()
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("could not read %s: %s", soul, exc)
+            return
+        if current == wanted:
+            return
+        text = current.decode("utf-8", errors="replace")
+        if any(marker in text for marker in _STOCK_SOUL_MARKERS):
+            reason = "replacing stock"
+        elif sidecar.is_file() and sidecar.read_text(
+            encoding="utf-8", errors="replace"
+        ).strip() == _digest(current):
+            reason = "updating from template"
+        else:
+            # Edited by hand or by the agent — not ours to overwrite.
+            return
+        logger.info("%s SOUL.md in %s", reason, home)
+
+    soul.write_bytes(wanted)
+    try:
+        sidecar.write_text(_digest(wanted), encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001
+        # Only costs us the ability to auto-update this profile later.
+        logger.warning("could not write %s: %s", sidecar, exc)
+
+
 # Seeding touches the filesystem, so it happens once per slug per process
 # rather than on every request.
 _seeded: set[str] = set()
@@ -156,6 +240,7 @@ def _seed_profile(home: Path) -> None:
         template = _seed_template()
         if template is not None:
             shutil.copyfile(template, config)
+    _install_soul(home)
 
 
 def resolve_profile(raw_id: Optional[str], *, create: bool = True) -> UserProfile:

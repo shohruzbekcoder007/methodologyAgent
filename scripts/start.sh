@@ -35,6 +35,20 @@ if [[ ! -f "$HERMES_HOME/config.yaml" ]]; then
   fi
 fi
 
+# The agent's SOUL.md. Per-user profiles get theirs from
+# agents/user_profiles.py; this covers the shared home, which the framework
+# also seeds with a stock file naming itself and its vendor. Only a stock file
+# is replaced -- one the agent wrote about itself is left alone.
+SOUL_TEMPLATE="${AGENT_SOUL_TEMPLATE:-$APP_HOME/prompts/agent_soul.md}"
+if [[ -f "$SOUL_TEMPLATE" ]]; then
+  if [[ ! -f "$HERMES_HOME/SOUL.md" ]] \
+     || grep -qE 'Hermes Agent|Nous Research' "$HERMES_HOME/SOUL.md"; then
+    cp "$SOUL_TEMPLATE" "$HERMES_HOME/SOUL.md"
+    chown appuser:appuser "$HERMES_HOME/SOUL.md" 2>/dev/null || true
+    log "Installed SOUL.md"
+  fi
+fi
+
 log "Starting Hermes host service"
 
 cd "$APP_HOME"

@@ -357,6 +357,14 @@ class HermesHostService:
             "enabled_toolsets": self._enabled_toolsets(),
             "skip_memory": self.skip_memory,
             "skip_context_files": _env_bool("HERMES_SKIP_CONTEXT_FILES", True),
+            # Load SOUL.md from the profile's own home even though context
+            # files are skipped. Without this the framework decides the agent
+            # has no identity file and falls back to its built-in one, which
+            # opens by naming the framework and its vendor -- text the agent is
+            # then told about itself on every turn. `skip_context_files` stays
+            # on: it is what keeps the working directory's own instruction
+            # files out, and that is still what we want.
+            "load_soul_identity": _env_bool("HERMES_LOAD_SOUL_IDENTITY", True),
             "ephemeral_system_prompt": self.system_prompt,
             "platform": "hermes-host",
             "api_key": self.api_key,
