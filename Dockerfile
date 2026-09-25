@@ -38,6 +38,12 @@ COPY app ./app
 RUN pip install -r requirements.txt \
     && pip install .
 
+# Hermes' own runtime dependencies, read from its pyproject so a new upstream
+# requirement (e.g. psutil) does not break the import check below.
+RUN python -c "import tomllib; d=tomllib.load(open('/opt/hermes-agent/pyproject.toml','rb')); print('\n'.join(d['project'].get('dependencies', [])))" > /tmp/hermes-reqs.txt \
+    && cat /tmp/hermes-reqs.txt \
+    && pip install -r /tmp/hermes-reqs.txt
+
 # Hermes is a hard requirement: fail the build rather than ship an image that
 # silently falls back to hermes_lite.
 ENV PYTHONPATH=/opt/hermes-agent

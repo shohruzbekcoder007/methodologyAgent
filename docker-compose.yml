@@ -165,7 +165,7 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
 
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${MONGO_PORT:-27118}:27017"
+      - "127.0.0.1:${MONGO_PORT:-27118}:27017"
 
     volumes:
       - mongo_data:/data/db
@@ -207,8 +207,8 @@ services:
       NEO4J_server_http_advertised__address: 127.0.0.1:${NEO4J_HTTP_PORT:-9096}
 
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${NEO4J_HTTP_PORT:-9096}:7474"
-      - "${BIND_ADDRESS:-127.0.0.1}:${NEO4J_BOLT_PORT:-9097}:7687"
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-9096}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-9097}:7687"
 
     volumes:
       - neo4j_data:/data

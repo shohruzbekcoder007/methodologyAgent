@@ -68,13 +68,19 @@ def _vector_chunks(query: str, k: int) -> list[str]:
         return []
     if not vector:
         return []
-    rows = read_query(
-        f"CALL db.index.vector.queryNodes('{CHUNK_VECTOR_INDEX}', $k, $vec) "
-        "YIELD node AS c, score "
-        "RETURN c.chunk_id AS key ORDER BY score DESC",
-        k=k,
-        vec=vector,
-    )
+    try:
+        rows = read_query(
+            f"CALL db.index.vector.queryNodes('{CHUNK_VECTOR_INDEX}', $k, $vec) "
+            "YIELD node AS c, score "
+            "RETURN c.chunk_id AS key ORDER BY score DESC",
+            k=k,
+            vec=vector,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Same degradation for a store that has not been embedded yet (no
+        # vector index after a fresh restore): BM25 still answers.
+        logger.warning("vector half unavailable, falling back to BM25 only: %s", exc)
+        return []
     return [r["key"] for r in rows if r.get("key")]
 
 
